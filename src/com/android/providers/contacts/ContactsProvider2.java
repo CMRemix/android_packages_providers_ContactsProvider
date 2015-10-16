@@ -36,6 +36,8 @@ import android.content.pm.PackageManager;
 import android.content.pm.PackageManager.NameNotFoundException;
 import android.content.pm.ProviderInfo;
 import android.content.res.AssetFileDescriptor;
+import android.content.res.AssetManager;
+import android.content.res.Configuration;
 import android.content.res.Resources;
 import android.content.res.Resources.NotFoundException;
 import android.database.AbstractCursor;
@@ -107,6 +109,7 @@ import android.provider.SyncStateContract;
 import android.telephony.PhoneNumberUtils;
 import android.telephony.TelephonyManager;
 import android.text.TextUtils;
+import android.util.DisplayMetrics;
 import android.util.Log;
 
 import com.android.common.content.ProjectionMap;
@@ -150,6 +153,7 @@ import com.android.providers.contacts.database.DeletedContactsTableUtil;
 import com.android.providers.contacts.database.MoreDatabaseUtils;
 import com.android.providers.contacts.util.Clock;
 import com.android.providers.contacts.util.DbQueryUtils;
+import com.android.providers.contacts.util.PreloadedContactsFileParser;
 import com.android.providers.contacts.util.NeededForTesting;
 import com.android.providers.contacts.util.UserUtils;
 import com.android.vcard.VCardComposer;
@@ -161,14 +165,13 @@ import com.google.android.collect.Sets;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 
-import libcore.io.IoUtils;
-
 import java.io.BufferedWriter;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileDescriptor;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
@@ -186,6 +189,9 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+
+import libcore.io.IoUtils;
+import org.json.JSONException;
 
 /**
  * Contacts content provider. The contract between this provider and applications
@@ -237,6 +243,8 @@ public class ContactsProvider2 extends AbstractContactsProvider
     private static final String DEFAULT_CONTACT_PREFERENCE_SET = "DefaultSet";
     private static final String DEFAULT_CONTACT_PREFERENCE_RAW_CONTACT_ID = "DefaultContactId";
     private static final int DEFAULT_CONTACT_ID = -1;
+
+    private static final String PREF_PRELOADED_CONTACTS_ADDED = "preloaded_contacts_added";
 
     /** Default for the maximum number of returned aggregation suggestions. */
     private static final int DEFAULT_MAX_SUGGESTIONS = 5;
@@ -1914,9 +1922,77 @@ public class ContactsProvider2 extends AbstractContactsProvider
                 if (isDefaultContactRequired()) {
                     addDefaultContact();
                 }
+
+                // TODO : merge the `preloaded contacts` and `default contact`(^) constructs
+                Resources res = getRegionLockedResources();
+                if (res != null && shouldAttemptPreloadingContacts(res)) {
+                    try {
+                        InputStream inputStream = res.openRawResource(R.raw.preloaded_contacts);
+                        PreloadedContactsFileParser pcfp = new
+                                PreloadedContactsFileParser(inputStream);
+                        ArrayList<ContentProviderOperation> cpOperations = pcfp.parseForContacts();
+                        if (cpOperations == null) {
+                            break;
+                        }
+
+                        getContext().getContentResolver().applyBatch(ContactsContract.AUTHORITY,
+                                cpOperations);
+                        // persist the completion of the transaction
+                        onPreloadingContactsComplete();
+
+                    } catch (NotFoundException nfe) {
+                        System.out.println();
+                        nfe.printStackTrace();
+                    } catch (JSONException e) {
+                        e.printStackTrace();
+                    } catch (RemoteException e) {
+                        e.printStackTrace();
+                    } catch (OperationApplicationException e) {
+                        e.printStackTrace();
+                    }
+                }
+
                 break;
             }
         }
+    }
+
+    private Resources getRegionLockedResources() {
+        Configuration tempConfiguration = new Configuration();
+        String mcc = SystemProperties.get("ro.prebundled.mcc");
+        Resources regionResources = null;
+        String publicSourceDir = null;
+        try {
+            Context ctx = getContext();
+            String packageName = ctx.getPackageName();
+            publicSourceDir = ctx.getPackageManager().getApplicationInfo(packageName, 0)
+                    .publicSourceDir;
+        } catch (NameNotFoundException e) {
+            e.printStackTrace();
+        }
+
+        if (!TextUtils.isEmpty(mcc) && !TextUtils.isEmpty(publicSourceDir)) {
+            tempConfiguration.mcc = Integer.parseInt(mcc);
+            AssetManager assetManager = new AssetManager();
+            assetManager.addAssetPath(publicSourceDir);
+            regionResources = new Resources(assetManager, new DisplayMetrics(),
+                    tempConfiguration);
+        }
+
+        return regionResources;
+    }
+
+    private boolean shouldAttemptPreloadingContacts(Resources res) {
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(getContext());
+        return res.getBoolean(R.bool.config_preload_contacts) &&
+                !prefs.getBoolean(PREF_PRELOADED_CONTACTS_ADDED, false);
+    }
+
+    private void onPreloadingContactsComplete() {
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(getContext());
+        SharedPreferences.Editor editor = prefs.edit();
+        editor.putBoolean(PREF_PRELOADED_CONTACTS_ADDED, true);
+        editor.commit();
     }
 
     public void onLocaleChanged() {
